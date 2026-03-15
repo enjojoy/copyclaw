@@ -1,0 +1,22 @@
+{
+  "id": "copyclaw",
+  "name": "CopyClaw",
+  "description": "AI-powered writing editor — surgical text rewrites via selection",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "corsOrigin": {
+        "type": "string",
+        "description": "Allowed CORS origin for the CopyClaw app (e.g. http://localhost:3000)"
+      }
+    }
+  },
+  "uiHints": {
+    "corsOrigin": {
+      "label": "CopyClaw App URL",
+      "placeholder": "http://localhost:3000"
+    }
+  }
+}
