@@ -24,3 +24,113 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Tiptap editor typography — high specificity to override any resets */
+.ProseMirror h1,
+.tiptap h1 {
+  font-size: 28px !important;
+  font-weight: 700 !important;
+  line-height: 1.2 !important;
+  margin: 0.6em 0 0.3em !important;
+  color: inherit !important;
+}
+.ProseMirror h2,
+.tiptap h2 {
+  font-size: 22px !important;
+  font-weight: 600 !important;
+  line-height: 1.3 !important;
+  margin: 0.5em 0 0.25em !important;
+  color: #ccc !important;
+}
+.ProseMirror h3,
+.tiptap h3 {
+  font-size: 18px !important;
+  font-weight: 600 !important;
+  line-height: 1.4 !important;
+  margin: 0.4em 0 0.2em !important;
+  color: #bbb !important;
+}
+.ProseMirror p,
+.tiptap p {
+  font-size: 16px;
+  line-height: 1.6;
+  margin: 0.4em 0;
+}
+.ProseMirror ul,
+.tiptap ul {
+  list-style: disc !important;
+  padding-left: 1.5em !important;
+  margin: 0.5em 0 !important;
+}
+.ProseMirror ol,
+.tiptap ol {
+  list-style: decimal !important;
+  padding-left: 1.5em !important;
+  margin: 0.5em 0 !important;
+}
+.ProseMirror li,
+.tiptap li {
+  margin: 0.2em 0;
+}
+.ProseMirror blockquote,
+.tiptap blockquote {
+  border-left: 3px solid #555 !important;
+  padding-left: 1em !important;
+  margin: 0.5em 0 !important;
+  color: #aaa !important;
+  font-style: italic !important;
+}
+.ProseMirror code,
+.tiptap code {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 0.15em 0.3em;
+  font-size: 0.9em;
+  font-family: monospace;
+}
+.ProseMirror pre,
+.tiptap pre {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 0.75em 1em;
+  margin: 0.5em 0;
+  overflow-x: auto;
+}
+.ProseMirror pre code,
+.tiptap pre code {
+  background: none;
+  padding: 0;
+}
+.ProseMirror hr,
+.tiptap hr {
+  border: none;
+  border-top: 1px solid #333;
+  margin: 1.5em 0;
+}
+.ProseMirror strong,
+.tiptap strong {
+  font-weight: 700 !important;
+}
+.ProseMirror em,
+.tiptap em {
+  font-style: italic !important;
+}
+.ProseMirror s,
+.tiptap s {
+  text-decoration: line-through !important;
+}
+.ProseMirror mark,
+.tiptap mark {
+  background-color: rgba(255, 165, 0, 0.3);
+  border-radius: 2px;
+  padding: 0.05em 0.1em;
+}
+
+/* Ensure clipboard copy preserves formatting */
+.ProseMirror [data-placeholder]::before {
+  color: #555;
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}

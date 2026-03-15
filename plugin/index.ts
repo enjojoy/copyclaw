@@ -4,21 +4,49 @@ export default function register(api: PluginApi) {
   const cfg = api.config?.plugins?.entries?.copyclaw?.config ?? {};
   const corsOrigin = cfg.corsOrigin ?? "http://localhost:3000";
 
-  // CORS preflight
+  function setCorsHeaders(res: any) {
+    res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+
+  function handleCors(req: any, res: any): boolean {
+    setCorsHeaders(res);
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return true;
+    }
+    return false;
+  }
+
+  async function readBody(req: any): Promise<any> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    return JSON.parse(Buffer.concat(chunks).toString());
+  }
+
+  function extractAssistantReply(messages: unknown[]): string {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i] as any;
+      if (msg.role === "assistant" && msg.content) {
+        return typeof msg.content === "string"
+          ? msg.content.trim()
+          : Array.isArray(msg.content)
+            ? msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("").trim()
+            : "";
+      }
+    }
+    return "";
+  }
+
+  // Rewrite endpoint — surgical text replacement via a one-shot session
   api.registerHttpRoute({
     path: "/copyclaw/rewrite",
     auth: "plugin",
     match: "exact",
     handler: async (req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", corsOrigin);
-      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-      if (req.method === "OPTIONS") {
-        res.statusCode = 204;
-        res.end();
-        return true;
-      }
+      if (handleCors(req, res)) return true;
 
       if (req.method !== "POST") {
         res.statusCode = 405;
@@ -27,11 +55,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk);
-        const body = JSON.parse(Buffer.concat(chunks).toString());
-
-        const { selectedText, fullText, instruction, tone } = body;
+        const { selectedText, fullText, instruction, tone } = await readBody(req);
 
         if (!selectedText || !instruction) {
           res.statusCode = 400;
@@ -39,16 +63,16 @@ export default function register(api: PluginApi) {
           return true;
         }
 
-        const systemPrompt = `You are CopyClaw, a surgical AI writing editor.
+        const message = `You are acting as CopyClaw, a surgical AI writing editor.
 You rewrite ONLY the selected text the user highlights, preserving the voice and flow of the surrounding content.
 
 Rules:
 - Return ONLY the rewritten version of the selected text
 - Do not add commentary, explanations, or markdown formatting
 - Match the existing tone of the full document unless instructed otherwise
-- Keep roughly the same length unless asked to make it shorter or longer`;
+- Keep roughly the same length unless asked to make it shorter or longer
 
-        const userPrompt = `Full document context:
+Full document context:
 ---
 ${fullText}
 ---
@@ -60,31 +84,26 @@ ${selectedText}
 
 Instruction: ${instruction}${tone ? `\nTone preset: ${tone}` : ""}
 
-Return only the rewritten replacement for the selected text.`;
+Return only the rewritten replacement for the selected text. No other output.`;
 
-        // Call OpenAI directly (api.runtime.llm not yet in plugin SDK)
-        const openaiKey = process.env.OPENAI_API_KEY;
-        if (!openaiKey) throw new Error("OPENAI_API_KEY not set in environment");
+        const sessionKey = `copyclaw:rewrite:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-        const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${openaiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "gpt-4o",
-            messages: [
-              { role: "system", content: systemPrompt },
-              { role: "user", content: userPrompt },
-            ],
-            max_tokens: 2000,
-            temperature: 0.7,
-          }),
+        const { runId } = await api.runtime.subagent.run({
+          sessionKey,
+          message,
+          deliver: false,
+          idempotencyKey: sessionKey,
         });
 
-        const openaiData = await openaiRes.json();
-        const rewritten = openaiData.choices?.[0]?.message?.content?.trim() ?? "";
+        const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 60_000 });
+        if (waitResult.status !== "ok") {
+          throw new Error(waitResult.error ?? `Subagent run failed: ${waitResult.status}`);
+        }
+
+        const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 5 });
+        const rewritten = extractAssistantReply(messages);
+
+        api.runtime.subagent.deleteSession({ sessionKey }).catch(() => {});
 
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
@@ -99,18 +118,90 @@ Return only the rewritten replacement for the selected text.`;
     },
   });
 
+  // Chat endpoint — persistent conversational session for ideation & writing help
+  api.registerHttpRoute({
+    path: "/copyclaw/chat",
+    auth: "plugin",
+    match: "exact",
+    handler: async (req, res) => {
+      if (handleCors(req, res)) return true;
+
+      if (req.method !== "POST") {
+        res.statusCode = 405;
+        res.end(JSON.stringify({ error: "Method not allowed" }));
+        return true;
+      }
+
+      try {
+        const { message, documentContext, sessionId } = await readBody(req);
+
+        if (!message) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: "message is required" }));
+          return true;
+        }
+
+        // Persistent session per browser tab so conversation continues
+        const sessionKey = `copyclaw:chat:${sessionId ?? "default"}`;
+
+        const contextPreamble = documentContext
+          ? `\n\n[Current document the user is working on]\n---\n${documentContext}\n---\n\n`
+          : "";
+
+        const fullMessage = `${contextPreamble}${message}`;
+
+        const idempotencyKey = `${sessionKey}:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        const { runId } = await api.runtime.subagent.run({
+          sessionKey,
+          message: fullMessage,
+          extraSystemPrompt: `You are CopyClaw, an AI writing assistant embedded in a text editor. The user is working on a document and chatting with you in a side panel.
+
+You help them by:
+- Brainstorming and ideating on content
+- Suggesting text they can insert into their document
+- Answering questions about writing, tone, structure
+- Drafting paragraphs, sections, or full pieces when asked
+- Giving feedback on their writing
+
+Be conversational and helpful. When the user asks you to write or generate text, provide it directly. Keep responses focused and useful.`,
+          deliver: false,
+          idempotencyKey,
+        });
+
+        const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 60_000 });
+        if (waitResult.status !== "ok") {
+          throw new Error(waitResult.error ?? `Subagent run failed: ${waitResult.status}`);
+        }
+
+        const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 50 });
+        const reply = extractAssistantReply(messages);
+
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ reply }));
+      } catch (err: any) {
+        api.logger.error("CopyClaw chat error:", err);
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message ?? "Internal error" }));
+      }
+
+      return true;
+    },
+  });
+
   // Health check
   api.registerHttpRoute({
     path: "/copyclaw/health",
     auth: "plugin",
     match: "exact",
     handler: async (_req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+      setCorsHeaders(res);
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true, plugin: "copyclaw" }));
       return true;
     },
   });
 
-  api.logger.info("CopyClaw plugin loaded — routes: /copyclaw/rewrite, /copyclaw/health");
+  api.logger.info("CopyClaw plugin loaded — routes: /copyclaw/rewrite, /copyclaw/chat, /copyclaw/health");
 }
