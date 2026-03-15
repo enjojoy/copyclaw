@@ -25,35 +25,33 @@ const EMOJI_GROUPS = [
   ['9200', '128197', '128736', '128269', '128270', '128279', '128221', '128218', '128203', '128196'],
 ]
 
+type SuggestedEdit = {
+  id: string
+  original: string
+  replacement: string
+  description: string
+  status: 'pending' | 'accepted' | 'rejected'
+}
+
 type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
-  type?: 'rewrite' | 'generate' | 'text'
+  type?: 'rewrite' | 'generate' | 'text' | 'suggested-edits'
   original?: string
   rewritten?: string
   status?: 'pending' | 'accepted' | 'rejected'
   from?: number
   to?: number
+  edits?: SuggestedEdit[]
 }
 
 type Doc = {
   id: string
   title: string
   html: string
+  createdAt?: number
   updatedAt: number
-}
-
-function loadDocs(): Doc[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = localStorage.getItem('copyclaw:docs')
-    return raw ? JSON.parse(raw) : []
-  } catch { return [] }
-}
-
-function saveDocs(docs: Doc[]) {
-  localStorage.setItem('copyclaw:docs', JSON.stringify(docs))
 }
 
 function docTitle(html: string): string {
@@ -62,6 +60,42 @@ function docTitle(html: string): string {
   const text = div.textContent?.trim() ?? ''
   if (!text) return 'Untitled'
   return text.length > 40 ? text.slice(0, 40) + '...' : text
+}
+
+async function fetchDocs(): Promise<Doc[]> {
+  try {
+    const res = await fetch(`${OPENCLAW_URL}/copyclaw/docs`)
+    const data = await res.json()
+    return data.docs ?? []
+  } catch { return [] }
+}
+
+async function apiCreateDoc(doc: { id?: string; title?: string; html?: string }): Promise<Doc | null> {
+  try {
+    const res = await fetch(`${OPENCLAW_URL}/copyclaw/docs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(doc),
+    })
+    const data = await res.json()
+    return data.doc ?? null
+  } catch { return null }
+}
+
+async function apiUpdateDoc(id: string, updates: { title?: string; html?: string }): Promise<void> {
+  try {
+    await fetch(`${OPENCLAW_URL}/copyclaw/docs/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    })
+  } catch {}
+}
+
+async function apiDeleteDoc(id: string): Promise<void> {
+  try {
+    await fetch(`${OPENCLAW_URL}/copyclaw/docs/${id}`, { method: 'DELETE' })
+  } catch {}
 }
 
 export default function Editor() {
@@ -82,25 +116,40 @@ export default function Editor() {
   const emojiPickerRef = useRef<HTMLDivElement>(null)
   const [showTextDropdown, setShowTextDropdown] = useState(false)
   const textDropdownRef = useRef<HTMLDivElement>(null)
+  const [editMode, setEditMode] = useState(false)
+  const [pendingEdits, setPendingEdits] = useState<SuggestedEdit[]>([])
+  const [reviewIndex, setReviewIndex] = useState(0)
+  const preEditHtmlRef = useRef<string>('')
+  const [previewMode, setPreviewMode] = useState<'diff' | 'original' | 'changed'>('diff')
 
   const [docs, setDocs] = useState<Doc[]>([])
   const [activeDocId, setActiveDocId] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const skipSaveRef = useRef(false)
 
-  // Load docs from localStorage on mount
-  useEffect(() => {
-    const loaded = loadDocs()
+  // Load docs from server on mount, poll for new docs (e.g. created via Telegram)
+  const loadDocsFromServer = useCallback(async () => {
+    const loaded = await fetchDocs()
     if (loaded.length > 0) {
       setDocs(loaded)
-      setActiveDocId(loaded[0].id)
-    } else {
-      const first: Doc = { id: crypto.randomUUID(), title: 'Untitled', html: '', updatedAt: Date.now() }
-      setDocs([first])
-      setActiveDocId(first.id)
-      saveDocs([first])
+      setActiveDocId(prev => {
+        if (prev && loaded.some(d => d.id === prev)) return prev
+        return loaded[0].id
+      })
+    } else if (docs.length === 0) {
+      const created = await apiCreateDoc({ title: 'Untitled', html: '' })
+      if (created) {
+        setDocs([created])
+        setActiveDocId(created.id)
+      }
     }
   }, [])
+
+  useEffect(() => {
+    loadDocsFromServer()
+    const interval = setInterval(loadDocsFromServer, 5000)
+    return () => clearInterval(interval)
+  }, [loadDocsFromServer])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -137,16 +186,14 @@ export default function Editor() {
       setWordCount(words)
       setCharCount(text.length)
 
-      // Auto-save current doc
+      // Auto-save current doc to server (debounced via ref)
       if (!skipSaveRef.current && activeDocId) {
         const html = editor.getHTML()
-        setDocs(prev => {
-          const updated = prev.map(d =>
-            d.id === activeDocId ? { ...d, html, title: docTitle(html), updatedAt: Date.now() } : d
-          )
-          saveDocs(updated)
-          return updated
-        })
+        const title = docTitle(html)
+        setDocs(prev => prev.map(d =>
+          d.id === activeDocId ? { ...d, html, title, updatedAt: Date.now() } : d
+        ))
+        apiUpdateDoc(activeDocId, { html, title })
       }
     },
     onSelectionUpdate({ editor }) {
@@ -180,13 +227,11 @@ export default function Editor() {
     // Save current doc first
     if (activeDocId) {
       const html = editor.getHTML()
-      setDocs(prev => {
-        const updated = prev.map(d =>
-          d.id === activeDocId ? { ...d, html, title: docTitle(html), updatedAt: Date.now() } : d
-        )
-        saveDocs(updated)
-        return updated
-      })
+      const title = docTitle(html)
+      setDocs(prev => prev.map(d =>
+        d.id === activeDocId ? { ...d, html, title, updatedAt: Date.now() } : d
+      ))
+      apiUpdateDoc(activeDocId, { html, title })
     }
     // Load new doc
     const doc = docs.find(d => d.id === docId)
@@ -202,40 +247,31 @@ export default function Editor() {
     }
   }, [editor, activeDocId, docs])
 
-  const createNewDoc = useCallback(() => {
+  const createNewDoc = useCallback(async () => {
     if (!editor) return
     // Save current doc
     if (activeDocId) {
       const html = editor.getHTML()
-      setDocs(prev => {
-        const updated = prev.map(d =>
-          d.id === activeDocId ? { ...d, html, title: docTitle(html), updatedAt: Date.now() } : d
-        )
-        saveDocs(updated)
-        return updated
-      })
+      apiUpdateDoc(activeDocId, { html, title: docTitle(html) })
     }
-    const newDoc: Doc = { id: crypto.randomUUID(), title: 'Untitled', html: '', updatedAt: Date.now() }
-    setDocs(prev => {
-      const updated = [newDoc, ...prev]
-      saveDocs(updated)
-      return updated
-    })
-    skipSaveRef.current = true
-    editor.commands.setContent('')
-    skipSaveRef.current = false
-    setActiveDocId(newDoc.id)
-    setChatMessages([])
-    setWordCount(0)
-    setCharCount(0)
+    const created = await apiCreateDoc({ title: 'Untitled', html: '' })
+    if (created) {
+      setDocs(prev => [created, ...prev])
+      skipSaveRef.current = true
+      editor.commands.setContent('')
+      skipSaveRef.current = false
+      setActiveDocId(created.id)
+      setChatMessages([])
+      setWordCount(0)
+      setCharCount(0)
+    }
   }, [editor, activeDocId])
 
-  const deleteDoc = useCallback((docId: string) => {
-    if (docs.length <= 1) return // Don't delete last doc
+  const deleteDoc = useCallback(async (docId: string) => {
+    if (docs.length <= 1) return
+    await apiDeleteDoc(docId)
     setDocs(prev => {
       const updated = prev.filter(d => d.id !== docId)
-      saveDocs(updated)
-      // If deleting active doc, switch to first remaining
       if (docId === activeDocId && editor && updated.length > 0) {
         const next = updated[0]
         skipSaveRef.current = true
@@ -402,6 +438,69 @@ export default function Editor() {
       } finally {
         setChatLoading(false)
       }
+    } else if (editMode) {
+      // Suggest edits mode — document-wide multi-edit
+      const userMsgId = crypto.randomUUID()
+      addChatMessage({
+        id: userMsgId,
+        role: 'user',
+        content: `\u270F\uFE0F Edit: ${userInput}`,
+        type: 'text',
+      })
+
+      setChatLoading(true)
+      try {
+        const html = editor.getHTML()
+        const res = await fetch(`${OPENCLAW_URL}/copyclaw/suggest-edits`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ html, instruction: userInput }),
+        })
+        const data = await res.json()
+        if (data.edits && data.edits.length > 0) {
+          const edits: SuggestedEdit[] = data.edits.map((e: any) => ({
+            id: crypto.randomUUID(),
+            original: e.original,
+            replacement: e.replacement,
+            description: e.description,
+            status: 'pending' as const,
+          }))
+
+          // Store pre-edit HTML and show preview of first edit
+          preEditHtmlRef.current = editor.getHTML()
+          setPendingEdits(edits)
+          setReviewIndex(0)
+          setPreviewMode('diff')
+
+          // Show preview: apply first edit inline with markers
+          showEditPreview(editor, edits[0], 'diff')
+
+          addChatMessage({
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: `${edits.length} suggested edit${edits.length > 1 ? 's' : ''}:`,
+            type: 'suggested-edits',
+            edits,
+          })
+        } else {
+          addChatMessage({
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: data.error ?? 'No edits suggested.',
+            type: 'text',
+          })
+        }
+      } catch (err) {
+        console.error(err)
+        addChatMessage({
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: 'Error: failed to get edit suggestions.',
+          type: 'text',
+        })
+      } finally {
+        setChatLoading(false)
+      }
     } else {
       // Chat mode — conversational interaction with the agent
       const userMsgId = crypto.randomUUID()
@@ -465,6 +564,139 @@ export default function Editor() {
   const dismissGenerated = useCallback((msgId: string) => {
     updateChatMessage(msgId, { status: 'rejected' })
   }, [updateChatMessage])
+
+  // Show a preview of the current edit in the editor using HTML replacement
+  const showEditPreview = useCallback((ed: typeof editor, edit: SuggestedEdit, mode: 'diff' | 'original' | 'changed' = 'diff') => {
+    if (!ed) return
+    let html = preEditHtmlRef.current
+    if (!html.includes(edit.original)) return
+
+    let previewHtml: string
+    if (mode === 'original') {
+      // Show original with subtle highlight
+      previewHtml = html.replace(
+        edit.original,
+        `<span style="background:rgba(239,68,68,0.1);border-bottom:2px solid rgba(239,68,68,0.4);padding:0 1px;border-radius:2px">${edit.original}</span>`
+      )
+    } else if (mode === 'changed') {
+      // Show replacement applied with highlight
+      previewHtml = html.replace(
+        edit.original,
+        `<span style="background:rgba(34,197,94,0.1);border-bottom:2px solid rgba(34,197,94,0.4);padding:0 1px;border-radius:2px">${edit.replacement}</span>`
+      )
+    } else {
+      // Diff: show both
+      previewHtml = html.replace(
+        edit.original,
+        `<span style="background:rgba(239,68,68,0.15);color:#f87171;text-decoration:line-through;padding:0 2px;border-radius:2px">${edit.original}</span>` +
+        ` <span style="background:rgba(34,197,94,0.15);color:#4ade80;padding:0 2px;border-radius:2px">${edit.replacement}</span>`
+      )
+    }
+
+    skipSaveRef.current = true
+    ed.commands.setContent(previewHtml)
+    skipSaveRef.current = false
+  }, [])
+
+  const advanceReview = useCallback((msgId: string) => {
+    if (!editor) return
+    // Find next pending edit after current index
+    let nextIdx = reviewIndex + 1
+    const updatedEdits = pendingEdits
+    while (nextIdx < updatedEdits.length && updatedEdits[nextIdx].status !== 'pending') {
+      nextIdx++
+    }
+    if (nextIdx < updatedEdits.length) {
+      setReviewIndex(nextIdx)
+      setPreviewMode('diff')
+      showEditPreview(editor, updatedEdits[nextIdx], 'diff')
+    } else {
+      // Done reviewing — apply final HTML
+      skipSaveRef.current = true
+      editor.commands.setContent(preEditHtmlRef.current)
+      skipSaveRef.current = false
+      setPendingEdits([])
+      setReviewIndex(0)
+    }
+  }, [editor, reviewIndex, pendingEdits, showEditPreview])
+
+  const acceptEdit = useCallback((msgId: string, editId: string) => {
+    if (!editor) return
+    const msg = chatMessages.find(m => m.id === msgId)
+    if (!msg?.edits) return
+    const edit = msg.edits.find(e => e.id === editId)
+    if (!edit || edit.status !== 'pending') return
+
+    // Apply this edit permanently to the base HTML
+    if (preEditHtmlRef.current.includes(edit.original)) {
+      preEditHtmlRef.current = preEditHtmlRef.current.replace(edit.original, edit.replacement)
+    }
+
+    // Update status
+    const updatedEdits = msg.edits.map(e =>
+      e.id === editId ? { ...e, status: 'accepted' as const } : e
+    )
+    updateChatMessage(msgId, { edits: updatedEdits })
+    setPendingEdits(prev => prev.map(e => e.id === editId ? { ...e, status: 'accepted' as const } : e))
+
+    advanceReview(msgId)
+  }, [editor, chatMessages, updateChatMessage, advanceReview])
+
+  const rejectEdit = useCallback((msgId: string, editId: string) => {
+    if (!editor) return
+    const msg = chatMessages.find(m => m.id === msgId)
+    if (!msg?.edits) return
+
+    const updatedEdits = msg.edits.map(e =>
+      e.id === editId ? { ...e, status: 'rejected' as const } : e
+    )
+    updateChatMessage(msgId, { edits: updatedEdits })
+    setPendingEdits(prev => prev.map(e => e.id === editId ? { ...e, status: 'rejected' as const } : e))
+
+    advanceReview(msgId)
+  }, [editor, chatMessages, updateChatMessage, advanceReview])
+
+  const acceptAllEdits = useCallback((msgId: string) => {
+    if (!editor) return
+    const msg = chatMessages.find(m => m.id === msgId)
+    if (!msg?.edits) return
+
+    // Apply all pending edits to the base HTML
+    let html = preEditHtmlRef.current
+    for (const edit of msg.edits) {
+      if (edit.status === 'pending' && html.includes(edit.original)) {
+        html = html.replace(edit.original, edit.replacement)
+      }
+    }
+    preEditHtmlRef.current = html
+    skipSaveRef.current = true
+    editor.commands.setContent(html)
+    skipSaveRef.current = false
+
+    setPendingEdits([])
+    setReviewIndex(0)
+    const updatedEdits = msg.edits.map(e =>
+      e.status === 'pending' ? { ...e, status: 'accepted' as const } : e
+    )
+    updateChatMessage(msgId, { edits: updatedEdits })
+  }, [editor, chatMessages, updateChatMessage])
+
+  const rejectAllEdits = useCallback((msgId: string) => {
+    if (!editor) return
+    // Restore original HTML
+    skipSaveRef.current = true
+    editor.commands.setContent(preEditHtmlRef.current)
+    skipSaveRef.current = false
+
+    setPendingEdits([])
+    setReviewIndex(0)
+    const msg = chatMessages.find(m => m.id === msgId)
+    if (!msg?.edits) return
+    const updatedEdits = msg.edits.map(e =>
+      e.status === 'pending' ? { ...e, status: 'rejected' as const } : e
+    )
+    updateChatMessage(msgId, { edits: updatedEdits })
+  }, [editor, chatMessages, updateChatMessage])
 
   return (
     <div className="h-screen bg-gray-950 text-gray-100 flex flex-col overflow-hidden">
@@ -722,6 +954,84 @@ export default function Editor() {
             </div>
           )}
 
+          {/* Edit review bar */}
+          {pendingEdits.length > 0 && pendingEdits.some(e => e.status === 'pending') && (() => {
+            const current = pendingEdits[reviewIndex]
+            const msgWithEdits = chatMessages.find(m => m.type === 'suggested-edits' && m.edits?.some(e => e.id === current?.id))
+            const totalPending = pendingEdits.filter(e => e.status === 'pending').length
+            const accepted = pendingEdits.filter(e => e.status === 'accepted').length
+            const rejected = pendingEdits.filter(e => e.status === 'rejected').length
+            return (
+              <div className="border-b border-orange-800/30 bg-orange-950/20 px-4 py-2 flex items-center gap-3 flex-shrink-0">
+                <span className="text-xs text-orange-400 font-medium">
+                  Reviewing edit {reviewIndex + 1}/{pendingEdits.length}
+                </span>
+                {current && (
+                  <span className="text-xs text-gray-400 truncate">{current.description}</span>
+                )}
+                {/* View toggle */}
+                {current && (
+                  <div className="flex bg-gray-800 rounded-lg overflow-hidden">
+                    <button
+                      onClick={() => { setPreviewMode('original'); showEditPreview(editor, current, 'original') }}
+                      className={`px-2 py-1 text-xs transition-colors ${previewMode === 'original' ? 'bg-red-900/40 text-red-300' : 'text-gray-500 hover:text-gray-300'}`}
+                    >
+                      Original
+                    </button>
+                    <button
+                      onClick={() => { setPreviewMode('diff'); showEditPreview(editor, current, 'diff') }}
+                      className={`px-2 py-1 text-xs transition-colors ${previewMode === 'diff' ? 'bg-orange-900/40 text-orange-300' : 'text-gray-500 hover:text-gray-300'}`}
+                    >
+                      Diff
+                    </button>
+                    <button
+                      onClick={() => { setPreviewMode('changed'); showEditPreview(editor, current, 'changed') }}
+                      className={`px-2 py-1 text-xs transition-colors ${previewMode === 'changed' ? 'bg-green-900/40 text-green-300' : 'text-gray-500 hover:text-gray-300'}`}
+                    >
+                      Changed
+                    </button>
+                  </div>
+                )}
+                <div className="flex-1" />
+                <span className="text-xs text-gray-600">
+                  {accepted > 0 && <span className="text-green-500">{accepted} accepted</span>}
+                  {accepted > 0 && rejected > 0 && ' \u00B7 '}
+                  {rejected > 0 && <span className="text-gray-500">{rejected} rejected</span>}
+                  {(accepted > 0 || rejected > 0) && ' \u00B7 '}
+                  {totalPending} left
+                </span>
+                {msgWithEdits && (
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => acceptEdit(msgWithEdits.id, current.id)}
+                      className="px-3 py-1 bg-green-700 hover:bg-green-600 rounded text-xs font-medium transition-colors"
+                    >
+                      {'\u2713'} Accept
+                    </button>
+                    <button
+                      onClick={() => rejectEdit(msgWithEdits.id, current.id)}
+                      className="px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded text-xs font-medium transition-colors"
+                    >
+                      {'\u2715'} Skip
+                    </button>
+                    <button
+                      onClick={() => acceptAllEdits(msgWithEdits.id)}
+                      className="px-3 py-1 bg-green-900/50 hover:bg-green-800/50 rounded text-xs transition-colors text-green-400"
+                    >
+                      Accept all
+                    </button>
+                    <button
+                      onClick={() => rejectAllEdits(msgWithEdits.id)}
+                      className="px-3 py-1 bg-gray-800/50 hover:bg-gray-700/50 rounded text-xs transition-colors text-gray-500"
+                    >
+                      Dismiss all
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+
           <div className="flex-1 p-8 overflow-auto min-h-0">
           <div className="max-w-3xl mx-auto relative">
             {/* Floating toolbar */}
@@ -872,8 +1182,68 @@ export default function Editor() {
                     )}
 
                     {msg.type === 'text' && (
-                      <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+                      <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm whitespace-pre-wrap">
                         {msg.content}
+                      </div>
+                    )}
+
+                    {msg.type === 'suggested-edits' && msg.edits && (
+                      <div className="space-y-2">
+                        <div className="text-xs text-gray-400 font-medium">{msg.content}</div>
+                        {/* Accept all / Reject all */}
+                        {msg.edits.some(e => e.status === 'pending') && (
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => acceptAllEdits(msg.id)}
+                              className="flex-1 py-1 bg-green-700 hover:bg-green-600 rounded-lg text-xs font-medium transition-colors"
+                            >
+                              {'\u2713'} Accept all
+                            </button>
+                            <button
+                              onClick={() => rejectAllEdits(msg.id)}
+                              className="flex-1 py-1 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs font-medium transition-colors"
+                            >
+                              {'\u2715'} Reject all
+                            </button>
+                          </div>
+                        )}
+                        {/* Individual edits */}
+                        {msg.edits.map((edit, idx) => (
+                          <div key={edit.id} className={`border rounded-lg overflow-hidden ${
+                            edit.status === 'accepted' ? 'border-green-800/50 opacity-60' :
+                            edit.status === 'rejected' ? 'border-gray-800 opacity-40' :
+                            'border-gray-700'
+                          }`}>
+                            <div className="px-3 py-1.5 bg-gray-800/50 flex items-center gap-2">
+                              <span className="text-xs text-gray-400 font-medium">#{idx + 1}</span>
+                              <span className="text-xs text-gray-300">{edit.description}</span>
+                              {edit.status === 'accepted' && <span className="ml-auto text-xs text-green-500">{'\u2713'}</span>}
+                              {edit.status === 'rejected' && <span className="ml-auto text-xs text-gray-600">{'\u2715'}</span>}
+                            </div>
+                            <div className="px-3 py-2 space-y-1">
+                              <div className="bg-red-950/30 rounded px-2 py-1 text-xs text-red-300/80 line-through"
+                                dangerouslySetInnerHTML={{ __html: edit.original.replace(/<[^>]*>/g, ' ').trim() }} />
+                              <div className="bg-green-950/30 rounded px-2 py-1 text-xs text-green-300/80"
+                                dangerouslySetInnerHTML={{ __html: edit.replacement.replace(/<[^>]*>/g, ' ').trim() }} />
+                            </div>
+                            {edit.status === 'pending' && (
+                              <div className="flex border-t border-gray-800">
+                                <button
+                                  onClick={() => acceptEdit(msg.id, edit.id)}
+                                  className="flex-1 py-1.5 text-xs font-medium text-green-400 hover:bg-green-900/20 transition-colors"
+                                >
+                                  {'\u2713'} Accept
+                                </button>
+                                <button
+                                  onClick={() => rejectEdit(msg.id, edit.id)}
+                                  className="flex-1 py-1.5 text-xs font-medium text-gray-500 hover:bg-gray-800 transition-colors border-l border-gray-800"
+                                >
+                                  {'\u2715'} Reject
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     )}
                   </div>
@@ -894,14 +1264,38 @@ export default function Editor() {
 
           {/* Chat input */}
           <div className="border-t border-gray-800 p-4">
+            {/* Edit mode toggle */}
+            {!hasSelection && (
+              <div className="flex items-center gap-2 mb-2">
+                <button
+                  onClick={() => setEditMode(prev => !prev)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-colors ${
+                    editMode
+                      ? 'bg-orange-600 text-white'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {'\u270F\uFE0F'} Edit mode
+                </button>
+                <span className="text-xs text-gray-600">
+                  {editMode ? 'Suggests changes to review one by one' : 'Chat freely with the AI'}
+                </span>
+              </div>
+            )}
             <div className="flex gap-2">
               <input
                 type="text"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendChat()}
-                placeholder={hasSelection ? 'Instruction for selected text...' : 'Ask to write something...'}
-                className="flex-1 bg-gray-800 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-orange-500 placeholder-gray-500"
+                placeholder={
+                  hasSelection ? 'Instruction for selected text...' :
+                  editMode ? 'Describe changes to make...' :
+                  'Ask to write something...'
+                }
+                className={`flex-1 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 placeholder-gray-500 ${
+                  editMode ? 'bg-gray-800 focus:ring-orange-500 border border-orange-800/30' : 'bg-gray-800 focus:ring-orange-500'
+                }`}
               />
               <button
                 onClick={sendChat}
